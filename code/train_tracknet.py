@@ -18,6 +18,7 @@ Examples:
 """
 import argparse
 import configparser
+import glob
 import os
 import random
 import time
@@ -37,10 +38,23 @@ FULL_W, FULL_H = 1920, 1080
 
 # ----------------------------------------------------------------------------- args
 
+ON_KAGGLE = os.path.isdir("/kaggle/working")
+
+
+def default_root():
+    """Locally: soccernet.ROOT. On Kaggle: the folder under /kaggle/input that holds the SNMOT-* dirs."""
+    if ON_KAGGLE:
+        hits = sorted(glob.glob("/kaggle/input/**/SNMOT-*", recursive=True))
+        if hits:
+            return os.path.dirname(hits[0])
+    return sn.ROOT
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--root", default=sn.ROOT, help="folder with SNMOT-* sequences")
-    p.add_argument("--cache", default=os.path.expanduser("~/ball_tracker/data/soccernet/tracknet_cache"))
+    work = "/kaggle/working" if ON_KAGGLE else os.path.expanduser("~/ball_tracker")
+    p.add_argument("--root", default=None, help="folder with SNMOT-* sequences (auto-found on Kaggle)")
+    p.add_argument("--cache", default=os.path.join(work, "data/soccernet/tracknet_cache"))
     p.add_argument("--size", default="640x360", help="network input WxH, both divisible by 8")
     p.add_argument("--sigma", type=float, default=2.5, help="Gaussian radius of the target (px at --size)")
     p.add_argument("--base", type=int, default=32, help="channels of first block. 64 = TrackNetV2 paper size")
@@ -55,10 +69,11 @@ def parse_args():
                    help="max fraction of training samples without a ball (rest are dropped)")
     p.add_argument("--limit-seqs", type=int, default=0, help="only use the first N sequences (debugging)")
     p.add_argument("--device", default="auto", help="auto | cuda | xpu | mps | cpu")
-    p.add_argument("--out", default=os.path.expanduser("~/ball_tracker/code/checkpoints/tracknet.pt"))
+    p.add_argument("--out", default=os.path.join(work, "checkpoints/tracknet.pt" if ON_KAGGLE else "code/checkpoints/tracknet.pt"))
     p.add_argument("--resume", default="", help="checkpoint to continue from")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
+    a.root = a.root or default_root()
     a.W, a.H = map(int, a.size.lower().split("x"))
     assert a.W % 8 == 0 and a.H % 8 == 0, "--size must be divisible by 8 (3 poolings)"
     return a
@@ -74,6 +89,11 @@ def pick_device(name):
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def autocast(device):
+    """fp16 mixed precision on CUDA (uses the tensor cores, e.g. on a T4); no-op elsewhere."""
+    return torch.autocast(device.type, dtype=torch.float16, enabled=device.type == "cuda")
 
 
 # ----------------------------------------------------------------------------- data
@@ -246,7 +266,9 @@ def evaluate_seqs(model, seqs, a, device):
                         worker_init_fn=worker_init)
     preds = defaultdict(dict)
     for x, _, idx in loader:
-        heat = torch.sigmoid(model(x.to(device))).squeeze(1).float().cpu().numpy()
+        with autocast(device):
+            logits = model(x.to(device))
+        heat = torch.sigmoid(logits.float()).squeeze(1).cpu().numpy()
         for h, i in zip(heat, idx.tolist()):
             seq, f = ds.items[i]
             xy = heatmap_to_xy(h, a.thr)
@@ -271,7 +293,7 @@ def main():
     a = parse_args()
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
     device = pick_device(a.device)
-    print(f"device: {device}")
+    print(f"device: {device} | data: {a.root}")
 
     seqs = sn.list_seqs(a.root)
     if a.limit_seqs:
@@ -308,6 +330,9 @@ def main():
         start_epoch, best_f1 = ck["epoch"] + 1, ck["best_f1"]
         print(f"resumed from epoch {ck['epoch']}, best F1 {best_f1:.3f}")
     print(f"params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    if a.resume and "scaler" in ck:
+        scaler.load_state_dict(ck["scaler"])
 
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     last_path = a.out.replace(".pt", "_last.pt")
@@ -317,10 +342,13 @@ def main():
         t0, running = time.time(), 0.0
         for step, (x, y, _) in enumerate(loader, 1):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            loss = wbce_loss(model(x), y)
+            with autocast(device):
+                logits = model(x)
+            loss = wbce_loss(logits.float(), y)                  # loss in fp32 for stability
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             sched.step()
             running += loss.item()
             if step % 50 == 0 or step == len(loader):
@@ -332,7 +360,7 @@ def main():
         print(f"== epoch {epoch + 1} val: F1 {m['f1']:.3f}  precision {m['precision']:.3f}  "
               f"recall {m['recall']:.3f}  (tp {m['tp']} fp {m['fp']} fn {m['fn']})", flush=True)
 
-        ck = dict(model=model.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(),
+        ck = dict(model=model.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(), scaler=scaler.state_dict(),
                   epoch=epoch, best_f1=max(best_f1, m["f1"]), args=vars(a), val=m)
         torch.save(ck, last_path)
         if m["f1"] > best_f1:

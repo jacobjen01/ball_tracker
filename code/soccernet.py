@@ -8,7 +8,7 @@ import re
 
 import numpy as np
 
-ROOT = os.path.expanduser("~/Perception/data/soccernet/train")
+ROOT = os.path.expanduser("~/data_tracker/data/soccernet/train")
 
 
 def list_seqs(root=ROOT):
