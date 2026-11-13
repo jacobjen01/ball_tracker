@@ -141,10 +141,12 @@ def _resize_seq(job):
 
 def build_cache(seqs, a):
     jobs = [(s, a.seq_root[s], a.cache, a.W, a.H) for s in seqs]
+    t0, frames = time.time(), 0
     with Pool(max(1, os.cpu_count() - 1)) as pool:
-        for seq, done in pool.imap_unordered(_resize_seq, jobs):
-            if done:
-                print(f"  cached {seq}: {done} frames")
+        for k, (seq, done) in enumerate(pool.imap_unordered(_resize_seq, jobs), 1):
+            frames += done
+            if k % 20 == 0 or k == len(jobs):                    # a progress line every 20 sequences
+                print(f"  cache: {k}/{len(jobs)} seqs ({frames} new frames, {time.time() - t0:.0f}s)", flush=True)
 
 
 class BallFrames(Dataset):
