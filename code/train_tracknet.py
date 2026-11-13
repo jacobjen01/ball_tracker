@@ -41,13 +41,18 @@ FULL_W, FULL_H = 1920, 1080
 ON_KAGGLE = os.path.isdir("/kaggle/working")
 
 
-def default_root():
-    """Locally: soccernet.ROOT. On Kaggle: the folder under /kaggle/input that holds the SNMOT-* dirs."""
-    if ON_KAGGLE:
-        hits = sorted(glob.glob("/kaggle/input/**/SNMOT-*", recursive=True))
+def find_split(split):
+    """On Kaggle: the folder named `split` (under /kaggle/input or /kaggle/working) that holds SNMOT-* dirs."""
+    for base in ("/kaggle/input", "/kaggle/working"):
+        hits = sorted(glob.glob(f"{base}/**/{split}/SNMOT-*", recursive=True))
         if hits:
             return os.path.dirname(hits[0])
-    return sn.ROOT
+    return ""
+
+
+def default_root():
+    """Locally: soccernet.ROOT. On Kaggle: the train/ folder that holds the SNMOT-* dirs."""
+    return (find_split("train") if ON_KAGGLE else "") or sn.ROOT
 
 
 def parse_args():
@@ -63,6 +68,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--val-games", type=int, default=2, help="number of games held out for validation")
+    p.add_argument("--val-root", default="",
+                   help="separate folder of SNMOT-* sequences to validate on (e.g. the test split); then ALL of "
+                        "--root is used for training. 'auto' = the test/ folder on Kaggle")
     p.add_argument("--val-stride", type=int, default=2, help="validate on every n-th frame (speed)")
     p.add_argument("--thr", type=float, default=0.5, help="heatmap peak below this = no ball")
     p.add_argument("--neg-frac", type=float, default=0.3,
@@ -74,6 +82,9 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
     a.root = a.root or default_root()
+    if a.val_root == "auto":
+        a.val_root = find_split("test")
+        assert a.val_root, "--val-root auto: no test/SNMOT-* folders found"
     a.W, a.H = map(int, a.size.lower().split("x"))
     assert a.W % 8 == 0 and a.H % 8 == 0, "--size must be divisible by 8 (3 poolings)"
     return a
@@ -129,7 +140,7 @@ def _resize_seq(job):
 
 
 def build_cache(seqs, a):
-    jobs = [(s, a.root, a.cache, a.W, a.H) for s in seqs]
+    jobs = [(s, a.seq_root[s], a.cache, a.W, a.H) for s in seqs]
     with Pool(max(1, os.cpu_count() - 1)) as pool:
         for seq, done in pool.imap_unordered(_resize_seq, jobs):
             if done:
@@ -142,10 +153,10 @@ class BallFrames(Dataset):
     def __init__(self, seqs, a, train):
         self.a, self.train = a, train
         self.dir = {s: os.path.join(a.cache, f"{a.W}x{a.H}", s) for s in seqs}
-        self.len = {s: seq_length(s, a.root) for s in seqs}
+        self.len = {s: seq_length(s, a.seq_root[s]) for s in seqs}
         self.gt = {}
         for s in seqs:                                           # full-res centres -> network size
-            self.gt[s] = {f: (x * a.W / FULL_W, y * a.H / FULL_H) for f, (x, y) in sn.load_ball_gt(s, a.root).items()}
+            self.gt[s] = {f: (x * a.W / FULL_W, y * a.H / FULL_H) for f, (x, y) in sn.load_ball_gt(s, a.seq_root[s]).items()}
 
         pos = [(s, f) for s in seqs for f in range(1, self.len[s] + 1) if f in self.gt[s]]
         neg = [(s, f) for s in seqs for f in range(1, self.len[s] + 1) if f not in self.gt[s]]
@@ -277,7 +288,7 @@ def evaluate_seqs(model, seqs, a, device):
 
     results = []
     for s in seqs:
-        gt = {f: xy for f, xy in sn.load_ball_gt(s, a.root).items() if f % a.val_stride == 0}
+        gt = {f: xy for f, xy in sn.load_ball_gt(s, a.seq_root[s]).items() if f % a.val_stride == 0}
         # only frames we actually evaluated count; renumber so evaluate() walks just those
         frames = [f for f in range(1, ds.len[s] + 1) if f % a.val_stride == 0]
         remap = {f: k + 1 for k, f in enumerate(frames)}
@@ -293,27 +304,46 @@ def main():
     a = parse_args()
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
     device = pick_device(a.device)
-    print(f"device: {device} | data: {a.root}")
+    print(f"device: {device} | train data: {a.root}" + (f" | val data: {a.val_root}" if a.val_root else ""))
 
     seqs = sn.list_seqs(a.root)
     if a.limit_seqs:
         seqs = seqs[:a.limit_seqs]
 
-    # split by game, so val never sees a match from training
-    by_game = defaultdict(list)
-    for s in seqs:
-        by_game[game_id(s, a.root)].append(s)
-    games = sorted(by_game)
-    if len(games) > 1:
-        val_games = games[-min(a.val_games, len(games) - 1):]
-        val_seqs = [s for g in val_games for s in by_game[g]]
-    else:                                                        # only one game (e.g. --limit-seqs): hold out last seq
-        val_games, val_seqs = games, seqs[-1:]
-    train_seqs = [s for s in seqs if s not in val_seqs]
-    print(f"{len(games)} games | train {len(train_seqs)} seqs | val {len(val_seqs)} seqs (games {val_games})")
+    assert seqs, f"no SNMOT-* sequences in {a.root} (wrong --root?)"
+    a.seq_root = {s: a.root for s in seqs}                       # which folder each sequence lives in
+
+    if a.val_root:
+        # separate split (e.g. SoccerNet test): train on EVERYTHING in --root
+        train_seqs, val_seqs = seqs, sn.list_seqs(a.val_root)
+        if a.limit_seqs:
+            val_seqs = val_seqs[:a.limit_seqs]
+        assert val_seqs, f"no SNMOT-* sequences in {a.val_root}"
+        overlap = set(train_seqs) & set(val_seqs)
+        assert not overlap, f"same sequences in train and val: {sorted(overlap)[:5]}"
+        a.seq_root.update({s: a.val_root for s in val_seqs})
+        train_games = sorted({game_id(s, a.root) for s in train_seqs})
+        val_games = sorted({game_id(s, a.val_root) for s in val_seqs})
+        print(f"train {len(train_seqs)} seqs (games {train_games}) | val {len(val_seqs)} seqs (games {val_games})")
+    else:
+        # split by game, so val never sees a match from training
+        by_game = defaultdict(list)
+        for s in seqs:
+            by_game[game_id(s, a.root)].append(s)
+        games = sorted(by_game)
+        if len(games) > 1:
+            val_games = games[-max(1, min(a.val_games, len(games) - 1)):]
+            val_seqs = [s for g in val_games for s in by_game[g]]
+        else:                                                    # only one game (e.g. --limit-seqs): hold out last seq
+            val_games, val_seqs = games, seqs[-1:]
+        train_seqs = [s for s in seqs if s not in val_seqs]
+        print(f"{len(games)} games | train {len(train_seqs)} seqs | val {len(val_seqs)} seqs (games {val_games})")
+
+    n_val_gt = sum(len(sn.load_ball_gt(s, a.seq_root[s])) for s in val_seqs)
+    assert n_val_gt > 0, "validation sequences have no ball ground truth (gt/gt.txt missing?)"
 
     print("resizing frames into cache (first run only)...")
-    build_cache(seqs, a)
+    build_cache(train_seqs + val_seqs, a)
 
     train_ds = BallFrames(train_seqs, a, train=True)
     loader = DataLoader(train_ds, batch_size=a.batch, shuffle=True, num_workers=a.workers,
