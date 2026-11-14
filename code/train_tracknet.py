@@ -22,6 +22,7 @@ import glob
 import os
 import random
 import time
+from datetime import datetime
 from collections import defaultdict
 from multiprocessing import Pool
 
@@ -78,7 +79,10 @@ def parse_args():
     p.add_argument("--limit-seqs", type=int, default=0, help="only use the first N sequences (debugging)")
     p.add_argument("--device", default="auto", help="auto | cuda | xpu | mps | cpu")
     p.add_argument("--out", default=os.path.join(work, "checkpoints/tracknet.pt" if ON_KAGGLE else "code/checkpoints/tracknet.pt"))
-    p.add_argument("--resume", default="", help="checkpoint to continue from")
+    p.add_argument("--resume", default="", help="checkpoint to continue from (use the *_last.pt file)")
+    p.add_argument("--time-limit", type=float, default=0,
+                   help="hours; stop cleanly before starting an epoch that would end past this (0 = off). "
+                        "Use ~11 on Kaggle (12 h session limit)")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
     a.root = a.root or default_root()
@@ -302,7 +306,16 @@ def evaluate_seqs(model, seqs, a, device):
 
 # ----------------------------------------------------------------------------- main
 
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# settings that must match when resuming, or the data / LR schedule would not line up
+RESUME_KEYS = ("epochs", "batch", "size", "base", "lr", "sigma", "neg_frac", "seed", "limit_seqs", "val_root", "val_games")
+
+
 def main():
+    t_start = time.time()
     a = parse_args()
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
     device = pick_device(a.device)
@@ -356,11 +369,22 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=a.epochs * len(loader))
     start_epoch, best_f1 = 0, -1.0
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")              # identifies this training run across sessions
     if a.resume:
-        ck = torch.load(a.resume, map_location=device)
+        ck = torch.load(a.resume, map_location=device, weights_only=False)
+        old = ck.get("args", {})
+        print(f"checkpoint {a.resume}\n  run {ck.get('run_id', '?')} | saved {ck.get('saved_at', '?')} | "
+              f"finished epoch {ck['epoch'] + 1}/{old.get('epochs', '?')} | best F1 {ck['best_f1']:.3f}")
+        bad = [f"{k}: checkpoint {old[k]!r} vs now {getattr(a, k)!r}"
+               for k in RESUME_KEYS if k in old and old[k] != getattr(a, k)]
+        assert not bad, "resume settings differ from the original run:\n  " + "\n  ".join(bad)
+        assert ck.get("steps_per_epoch", len(loader)) == len(loader), \
+            f"steps per epoch changed ({ck['steps_per_epoch']} -> {len(loader)}): different data?"
+        assert ck["epoch"] + 1 < a.epochs, "that run already finished all its epochs; nothing to resume"
         model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"]); sched.load_state_dict(ck["sched"])
         start_epoch, best_f1 = ck["epoch"] + 1, ck["best_f1"]
-        print(f"resumed from epoch {ck['epoch']}, best F1 {best_f1:.3f}")
+        run_id = ck.get("run_id", run_id)
+        print(f"resuming at epoch {start_epoch + 1}/{a.epochs}")
     print(f"params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     if a.resume and "scaler" in ck:
@@ -369,6 +393,8 @@ def main():
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     last_path = a.out.replace(".pt", "_last.pt")
 
+    print(f"run {run_id} | started {now()}" + (f" | time limit {a.time_limit:g} h" if a.time_limit else ""))
+    stopped_early = False
     for epoch in range(start_epoch, a.epochs):
         model.train()
         t0, running = time.time(), 0.0
@@ -393,14 +419,28 @@ def main():
               f"recall {m['recall']:.3f}  (tp {m['tp']} fp {m['fp']} fn {m['fn']})", flush=True)
 
         ck = dict(model=model.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(), scaler=scaler.state_dict(),
-                  epoch=epoch, best_f1=max(best_f1, m["f1"]), args=vars(a), val=m)
+                  epoch=epoch, best_f1=max(best_f1, m["f1"]), args={k: v for k, v in vars(a).items() if k != "seq_root"},
+                  val=m, run_id=run_id, saved_at=now(), steps_per_epoch=len(loader))
         torch.save(ck, last_path)
+        print(f"   saved {last_path} (epoch {epoch + 1}, {ck['saved_at']})", flush=True)
         if m["f1"] > best_f1:
             best_f1 = m["f1"]
             torch.save(ck, a.out)
-            print(f"   new best -> {a.out}")
+            print(f"   new best -> {a.out}", flush=True)
 
-    print(f"done. best val F1 {best_f1:.3f}")
+        if a.time_limit and epoch + 1 < a.epochs:
+            elapsed, epoch_time = time.time() - t_start, time.time() - t0
+            if elapsed + 1.1 * epoch_time > a.time_limit * 3600:        # 10% margin
+                print(f"time limit: {elapsed / 3600:.1f} h used, next epoch takes ~{epoch_time / 60:.0f} min "
+                      f"-> stopping after epoch {epoch + 1}/{a.epochs}.", flush=True)
+                stopped_early = True
+                break
+
+    if stopped_early:
+        print(f"STOPPED EARLY. continue in a new session with: --resume <path to>/{os.path.basename(last_path)} "
+              f"and the same settings. best val F1 so far {best_f1:.3f}")
+    else:
+        print(f"done. all {a.epochs} epochs finished. best val F1 {best_f1:.3f}")
 
 
 if __name__ == "__main__":
